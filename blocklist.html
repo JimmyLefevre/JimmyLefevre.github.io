@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Block list - Keeba's blog</title>
+</head>
+<body>
+<a href="index.html">Home</a>
+  <h1>The block list is a good data structure</h1>
+      <p>When making recursive parsers (not just literal recursive descent parsers, but any program that takes serialized recursive data as input), we want to read through some input stream linearly, generating our output as we go. In the case of a compiler, that output is often in a structured format, built piece by piece by our parser out of many heterogenous elements.</p>
+
+      <p>"Heterogenous" is the keyword, here. We generally do not know how many elements of each type we are about to see, and scanning ahead to find out would mean going through the whole input twice. Statically-sized arrays can't do the job. Dynamically-sized arrays can work, but then we lose pointer stability and we need some way to deal with the fragmentation caused by array resizes: either use a fast linear allocator and reserve roughly twice as much memory as we would otherwise need, or use a slow, malloc-style allocator that can deal with holes.</p>
+
+      <p>Another solution is the linked list. With a linked list, we can allocate any element in any order, without causing any fragmentation, right? So, we can use our linear allocator, and insertion is constant-time always, so no worries there!</p>
+
+      <p>Of course, that's just the theory; linked lists are slow. The whole point of using a fast allocator is to go fast, so why should we bother with a slow data structure?</p>
+
+      <p>We can make linked lists fast, and, in doing so, stumble upon a data structure with a bunch of unexpected, extraneous benefits.</p>
+
+      <p>Here is our basic list:</p>
+      <pre>
+  struct foo {
+    foo *Prev;
+    foo *Next;
+
+    // Some data we care about...
+  };
+      </pre>
+
+      <p>Now, what's a fast data structure? An array of course!</p>
+      <pre>
+  struct foo {
+    // Some data we care about...
+  };
+
+  #define FOOS_PER_BLOCK ... // Something appropriate...
+  struct foo_block {
+    foo_block *Prev;
+    foo_block *Next;
+
+    size_t Count;
+    foo Foos[FOOS_PER_BLOCK];
+  };
+      </pre>
+
+      <p>This linked-list-array hybrid has many interesting properties. We accept a small, bounded constant amount of internal fragmentation (because the last block in a list will generally not be full), while still completely avoiding external fragmentation, just like with the simple linked list. On top of that, as long as our blocks span at least a few cache lines, iteration will typically be just as fast as with a regular, flat array, because the vast majority of our accesses will be local and easily prefetched. Neat!</p>
+
+      <p>At first sight, this data structure may look like a nice solution to a somewhat niche problem. However, I have found it to be a surprisingly effective data representation that can be adapted to many scenarios with relatively little effort.</p>
+
+      <h2>The block list is a good array</h2>
+      <p>Removal in a block list has the same general complexity characteristics as removal in an array. If we want to preserve pointer or index stability, tombstones are the way to go in both cases: we "delete" an item by marking it as deleted. Furthermore, we can replicate array behavior for unordered removal: since our blocks are arranged in a doubly-linked list, we always have constant-time access to the last block. This allows us to delete an item by overwriting it with the last element, and thus keeping our block list compact incrementally, without any discrete cleanup passes like we'd have to do with tombstones.</p>
+
+      <p>The only operation for which a block list is markedly worse than an array, then, is random access. We need to hop from block to block, with all the serial dependencies and cache misses that entails, until we reach the one that contains our item. However, if we know random access is a common occurrence in our program, then we can accelerate lookups considerably by building an index of our blocks: we allocate an array that holds the address of every block in our list.</p>
+
+      <p>Accessing an item then becomes:</p>
+      <pre>
+  foo Foo = BlocksByIndex[I / FOOS_PER_BLOCK]-&gt;Foos[I % FOOS_PER_BLOCK];
+      </pre>
+      <p>Which is constant time. For power-of-two-sized blocks, the index computation just becomes a mask and a shift, too.
+      This index allows us to essentially treat our block list as a flat array, at the cost of one additional indirection.</p>
+
+      <p>With this auxiliary data structure, we can issue a constant-time remove-and-compact just like we would with a regular, flat array:</p>
+      <pre>
+  foo *Foo = BlocksByIndex[I / FOOS_PER_BLOCK]-&gt;Foos[I % FOOS_PER_BLOCK];
+  foo_block *LastBlock = &amp;BlocksByIndex[BlockCount - 1];
+
+  *Foo = LastBlock-&gt;Foos[--LastBlock&gt;Count];
+
+  if(!LastBlock-&gt;Count) --BlockCount;
+      </pre>
+
+      <h2>The block list is a good LRU</h2>
+      <p>We can think of the index presented above as a cache that is large enough to hold the addresses of every block in our list. We can also reduce its size and update it dynamically, which gives us an LRU. Since a single pointer gives us constant-time access to an entire block of items, we can make tiny caches that can give us fast access to a surprising amount of data. If our access patterns tend to be coherent with the way our blocks are laid out, this approach can give us tremendous bang for our buck.</p>
+
+      <h2>The block list is a good LOD solution</h2>
+      <p>Say we want to do queries on our block list based on some per-item flags. The basic way to do it would be something like this:</p>
+      <pre>
+  struct foo {
+    // Some data we care about...
+    int Flags;
+  };
+
+  for each Block {
+    for each Foo in Block {
+      if(Foo.Flags &amp; Filter) {
+        Process(Foo);
+      }
+    }
+  }
+      </pre>
+
+      <p>So, we check each item for its filter bits, and if it passes the filter, we process it. But how many filter bits do we have? How many items do we expect to have? Surely, in the vast majority of cases, these filter bits have extremely low information density, right?</p>
+
+      <p>Instead of duplicating redundant state on each item, we can directly hoist it out into the block definition:</p>
+      <pre>
+  struct foo {
+    // Some data we care about...
+  };
+
+  struct foo_block {
+    foo_block *Prev;
+    foo_block *Next;
+
+    int Flags; // Hoisted out from foo
+
+    size_t Count;
+    foo Foos[FOOS_PER_BLOCK];
+  };
+  </pre>
+  <p>Our query code then becomes:</p>
+  <pre>
+  for each Block {
+    if(Block.Flags &amp; Filter) {
+      for each Foo in Block {
+        Process(Foo);
+      }
+    }
+  }
+  </pre>
+  <p>Which allows us to accept or reject entire blocks at once, effectively providing a level-of-detail optimization for our query. What's more, we can extend this scheme by simply defining blocks of blocks:</p>
+  <pre>
+  struct foo_block_block {
+    foo_block_block *Prev;
+    foo_block_block *Next;
+
+    int XMin, YMin, XMax, YMax; // Bounding rect
+    size_t Count;
+    foo_block Blocks[FOO_BLOCKS_PER_BLOCK_BLOCK];
+  }
+  </pre>
+  <p>This technique can be used to extend our block list to an arbitrary number of levels of detail. In fact, an AABB tree can be represented as a hierarchical block list, with each level containing blocks that hold bounding volume information, as shown above. Ideally, this information becomes finer-grained as we approach the leaves, which makes our queries efficient.</p>
+
+</body>
